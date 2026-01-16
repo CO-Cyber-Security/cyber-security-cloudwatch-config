@@ -1,0 +1,152 @@
+name: Dependency Review (non-blocking)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Dependency review
+        id: dependency-review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          allow-licenses: ""
+          deny-licenses: ""
+          comment-summary-in-pr: true
+        continue-on-error: true
+
+      - name: Output detailed dependency issues (with suggested fixes)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT="dependency-review-report.json"
+          echo "Dependency Review: detailed results"
+          echo "---------------------------------"
+
+          if [ ! -f "$REPORT" ]; then
+            echo "No report file found at $REPORT. (The action may not have produced one for this run.)"
+            exit 0
+          fi
+
+          VULN_COUNT="$(jq '.vulnerabilities | length // 0' "$REPORT")"
+          if [ "$VULN_COUNT" -eq 0 ]; then
+            echo "No vulnerabilities reported."
+            exit 0
+          fi
+
+          echo "Found $VULN_COUNT vulnerability finding(s)."
+          echo
+
+          # Print each finding as a GitHub Actions error annotation + readable block
+          # and include a suggested fix (prefer patched version info if present).
+          jq -c '.vulnerabilities[]' "$REPORT" | while read -r v; do
+            PKG_NAME="$(echo "$v" | jq -r '.package.name // "unknown"')"
+            PKG_VERSION="$(echo "$v" | jq -r '.package.version // "unknown"')"
+            SEVERITY="$(echo "$v" | jq -r '.advisory.severity // "unknown"')"
+            SUMMARY="$(echo "$v" | jq -r '.advisory.summary // .advisory.description // "No summary provided."' | tr '\n' ' ')"
+            ADVISORY_URL="$(echo "$v" | jq -r '.advisory.url // empty')"
+            CWE="$(echo "$v" | jq -r '[.advisory.cwes[]?.cweId] | join(", ")' 2>/dev/null || true)"
+
+            # Try multiple likely fields for "patched" or "fixed" versions (schema differs by ecosystem).
+            PATCHED="$(echo "$v" | jq -r '
+              (
+                .advisory.patched_versions
+                // .advisory.patchedVersions
+                // .advisory.first_patched_version.identifier
+                // .advisory.firstPatchedVersion.identifier
+                // .advisory.fix_versions
+                // .advisory.fixed_versions
+                // empty
+              )' 2>/dev/null || true)"
+
+            VULN_RANGE="$(echo "$v" | jq -r '
+              (
+                .advisory.vulnerable_versions
+                // .advisory.vulnerableVersions
+                // .advisory.affected_versions
+                // .advisory.affectedVersions
+                // empty
+              )' 2>/dev/null || true)"
+
+            if [ -n "${PATCHED:-}" ] && [ "$PATCHED" != "null" ]; then
+              FIX="Upgrade ${PKG_NAME} from ${PKG_VERSION} to a patched version (${PATCHED}). Update your lockfile and re-run CI."
+            else
+              FIX="Upgrade ${PKG_NAME} to the latest safe version referenced in the advisory, update your lockfile, and re-run CI. If an upgrade is blocked, consider pinning a safe version or replacing the dependency."
+            fi
+
+            # Emit a GitHub Actions error annotation (shows clearly in the log + UI)
+            # Keep it short enough for annotations, with the fix included.
+            ANN="Dependency vulnerability: ${PKG_NAME}@${PKG_VERSION} (severity: ${SEVERITY}). Suggested fix: ${FIX}"
+            echo "::error title=Dependency Review::${ANN}"
+
+            # Also print a readable block in the logs.
+            echo "Package:   ${PKG_NAME}@${PKG_VERSION}"
+            echo "Severity:  ${SEVERITY}"
+            if [ -n "${VULN_RANGE:-}" ] && [ "$VULN_RANGE" != "null" ]; then
+              echo "Affected:  ${VULN_RANGE}"
+            fi
+            if [ -n "${CWE:-}" ]; then
+              echo "CWE:       ${CWE}"
+            fi
+            echo "Issue:     ${SUMMARY}"
+            if [ -n "${ADVISORY_URL:-}" ] && [ "$ADVISORY_URL" != "null" ]; then
+              echo "Advisory:  ${ADVISORY_URL}"
+            fi
+            echo "Fix:       ${FIX}"
+            echo "---------------------------------"
+          done
+
+      - name: Summarise result
+        if: always()
+        run: |
+          echo "## Dependency review" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.dependency-review.outcome }}" = "failure" ]; then
+            echo "- Dependencies with at least **high** severity issues were found." >> "$GITHUB_STEP_SUMMARY"
+            echo "- The check is non-blocking for now, but these should be addressed." >> "$GITHUB_STEP_SUMMARY"
+
+            if [ -f "dependency-review-report.json" ]; then
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "### Findings" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "| Package | Version | Severity | Suggested fix |" >> "$GITHUB_STEP_SUMMARY"
+              echo "|---|---:|---:|---|" >> "$GITHUB_STEP_SUMMARY"
+
+              jq -r '
+                (.vulnerabilities // [])[] |
+                . as $v |
+                ($v.package.name // "unknown") as $name |
+                ($v.package.version // "unknown") as $ver |
+                ($v.advisory.severity // "unknown") as $sev |
+                (
+                  $v.advisory.patched_versions
+                  // $v.advisory.patchedVersions
+                  // $v.advisory.first_patched_version.identifier
+                  // $v.advisory.firstPatchedVersion.identifier
+                  // $v.advisory.fix_versions
+                  // $v.advisory.fixed_versions
+                  // empty
+                ) as $patched |
+                if ($patched | length) > 0 then
+                  "| \($name) | \($ver) | \($sev) | Upgrade to patched version: \($patched) |"
+                else
+                  "| \($name) | \($ver) | \($sev) | Upgrade to the latest safe version per the advisory and update the lockfile |"
+                end
+              ' dependency-review-report.json >> "$GITHUB_STEP_SUMMARY" || true
+            fi
+          else
+            echo "- No high severity dependency issues were detected." >> "$GITHUB_STEP_SUMMARY"
+          fi
